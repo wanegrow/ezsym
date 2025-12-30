@@ -467,10 +467,26 @@ def process_symlink_creation(data, task_id):
                 if ENABLE_DOWNLOADS:
                     log_download_speed(task_id, torrent_id, dest_path)
                 else:
+                    # --- 1. FILTER: Block Junk Files ---
+                    if "996gg" in str(dest_path) or "996gg" in str(file_path):
+                        logging.info(f"Skipping junk file (Blocklist): {dest_path.name}")
+                        continue # Skip this file and move to the next one
+
                     src_path = RCLONE_MOUNT_PATH / torrent_info["filename"] / file_path
-                    if not dest_path.exists():
+
+                    # --- 2. FIX: Robust Symlink Creation (Ignores "File Exists") ---
+                    try:
                         dest_path.symlink_to(src_path)
                         logging.info(f"Symlink created: {dest_path} → {src_path}")
+                    except FileExistsError:
+                        logging.info(f"Symlink already exists (skipping): {dest_path}")
+                    except OSError as e:
+                        if e.errno == 17: # Error 17 = File Exists
+                             logging.info(f"Symlink already exists (skipping): {dest_path}")
+                        else:
+                             # Log other errors but don't crash the whole torrent
+                             logging.error(f"Symlink error: {e}")
+
                     trigger_media_scan(dest_path)
 
                 created_paths.append(str(dest_path))
