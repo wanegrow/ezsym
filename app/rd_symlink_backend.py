@@ -497,8 +497,8 @@ def process_symlink_creation(data, task_id):
 
                     # --- 3. ROBUST LINKING: Overwrite broken/old links ---
                     try:
-                        # If a link already exists (even a broken one), remove it
-                        if dest_path.lexists(): 
+                        # Use os.path.lexists because pathlib version may be too old
+                        if os.path.lexists(dest_path):
                             dest_path.unlink()
                             
                         dest_path.symlink_to(src_path)
