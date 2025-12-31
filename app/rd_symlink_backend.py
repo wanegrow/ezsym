@@ -469,7 +469,7 @@ def process_symlink_creation(data, task_id):
                     log_download_speed(task_id, torrent_id, dest_path)
                 else:
                     # --- 1. FILTER: Block Junk Files ---
-                    if any(word in str(file_path).lower() for word in ["996gg", "hhd800.com"]):
+                    if any(word in str(file_path).lower() for word in ["996gg"]):
                         logging.info(f"Skipping junk file: {file_path.name}")
                         continue 
 
