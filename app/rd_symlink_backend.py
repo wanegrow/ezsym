@@ -462,30 +462,49 @@ def process_symlink_creation(data, task_id):
         for file in selected_files:
             try:
                 file_path = Path(file["path"].lstrip("/"))
+                # This is the name of the link in your library
                 dest_path = dest_dir / f"{clean_filename(file_path.stem)}{file_path.suffix.lower()}"
 
                 if ENABLE_DOWNLOADS:
                     log_download_speed(task_id, torrent_id, dest_path)
                 else:
                     # --- 1. FILTER: Block Junk Files ---
-                    if "996gg" in str(dest_path) or "996gg" in str(file_path):
-                        logging.info(f"Skipping junk file (Blocklist): {dest_path.name}")
-                        continue # Skip this file and move to the next one
+                    if any(word in str(file_path).lower() for word in ["996gg", "hhd800.com"]):
+                        logging.info(f"Skipping junk file: {file_path.name}")
+                        continue 
 
-                    src_path = RCLONE_MOUNT_PATH / torrent_info["filename"] / file_path
+                    # --- 2. SMART SEARCH: Find the file in /scenes ---
+                    # Instead of just the messy RD name, look in your clean 'scenes' folder
+                    scenes_base = RCLONE_MOUNT_PATH.parent / "scenes"
+                    potential_dir = scenes_base / base_name
+                    src_path = None
 
-                    # --- 2. FIX: Robust Symlink Creation (Ignores "File Exists") ---
-                    try:
-                        dest_path.symlink_to(src_path)
-                        logging.info(f"Symlink created: {dest_path} → {src_path}")
-                    except FileExistsError:
-                        logging.info(f"Symlink already exists (skipping): {dest_path}")
-                    except OSError as e:
-                        if e.errno == 17: # Error 17 = File Exists
-                             logging.info(f"Symlink already exists (skipping): {dest_path}")
+                    if potential_dir.exists():
+                        # A. Try to find the exact file name RD gives us
+                        messy_file_path = potential_dir / file_path.name
+                        if messy_file_path.exists():
+                            src_path = messy_file_path
                         else:
-                             # Log other errors but don't crash the whole torrent
-                             logging.error(f"Symlink error: {e}")
+                            # B. If filename is messy (hhd800.com@...), grab the first video file
+                            for entry in potential_dir.iterdir():
+                                if entry.suffix.lower() in ['.mp4', '.mkv', '.avi', '.ts']:
+                                    src_path = entry
+                                    break
+                    
+                    # Fallback: If scenes search failed entirely, use the messy default
+                    if not src_path:
+                        src_path = RCLONE_MOUNT_PATH / torrent_info["filename"] / file_path
+
+                    # --- 3. ROBUST LINKING: Overwrite broken/old links ---
+                    try:
+                        # If a link already exists (even a broken one), remove it
+                        if dest_path.lexists(): 
+                            dest_path.unlink()
+                            
+                        dest_path.symlink_to(src_path)
+                        logging.info(f"Symlink created: {dest_path.name} → {src_path}")
+                    except Exception as e:
+                        logging.error(f"Symlink creation failed: {e}")
 
                     trigger_media_scan(dest_path)
 
