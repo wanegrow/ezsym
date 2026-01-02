@@ -75,7 +75,7 @@ MOVE_TO_FINAL_LIBRARY = os.getenv("MOVE_TO_FINAL_LIBRARY", "true").lower() == "t
 SYMLINK_BASE_PATH = Path(os.getenv("SYMLINK_BASE_PATH", "/symlinks"))
 DOWNLOAD_COMPLETE_PATH = Path(os.getenv("DOWNLOAD_COMPLETE_PATH", "/dl_complete"))
 FINAL_LIBRARY_PATH = Path(os.getenv("FINAL_LIBRARY_PATH", "/library"))
-RCLONE_MOUNT_PATH = Path(os.getenv("RCLONE_MOUNT_PATH", "/mnt/data/media/remote/realdebrid/__all__"))
+RCLONE_MOUNT_PATH = Path(os.getenv("RCLONE_MOUNT_PATH", "/mnt/zurg/__all__"))
 PLEX_TOKEN = os.getenv("PLEX_TOKEN")
 PLEX_LIBRARY_NAME = os.getenv("PLEX_LIBRARY_NAME")
 PLEX_SERVER_IP = os.getenv("PLEX_SERVER_IP")
@@ -105,14 +105,9 @@ def rd_proxy():
         payload = data.get('data', None)
 
         if not RD_API_KEY:
-            app.logger.error("RD_API_KEY missing in environment")
             return jsonify({"error": "Server configuration error"}), 500
 
-        if not endpoint.startswith('/'):
-            return jsonify({"error": f"Invalid endpoint format: {endpoint}"}), 400
-
-        # --- DEDUPLICATION FOR PROXY (Optional but safe) ---
-        # If this is an 'addMagnet' call, we want to make sure we don't spam RD
+        # --- DEDUPLICATION FOR PROXY ---
         if "addMagnet" in endpoint:
             magnet_hash = re.search(r'xt=urn:btih:([a-z0-9]+)', str(payload), re.I)
             if magnet_hash:
@@ -126,42 +121,32 @@ def rd_proxy():
         response = requests.request(
             method,
             f"https://api.real-debrid.com/rest/1.0{endpoint}",
-            headers={
-                "Authorization": f"Bearer {RD_API_KEY}",
-                "Cache-Control": "no-store, max-age=0"
-            },
+            headers={"Authorization": f"Bearer {RD_API_KEY}"},
             data=payload,
             timeout=15
         )
         
-        try:
-            response.raise_for_status()
-            if response.status_code in [200, 202, 204] and not response.text.strip():
-                resp = jsonify({"status": "success"})
-                resp.headers['Cache-Control'] = 'no-store, max-age=0'
-                return resp, 200
+        if response.status_code in [200, 202, 204] and not response.text.strip():
+            return jsonify({"status": "success"}), 200
 
-            resp = jsonify(response.json())
-            resp.headers['Cache-Control'] = 'no-store, max-age=0'
-            return resp, response.status_code
-        except requests.HTTPError as e:
-            return jsonify({"error": "RD API Error", "message": e.response.text}), e.response.status_code
-
+        return jsonify(response.json()), response.status_code
     except Exception as e:
-        app.logger.error(f"Proxy Error: {str(e)}")
-        return jsonify({"error": "Proxy processing failed"}), 500
+        return jsonify({"error": str(e)}), 500
 
-# [Existing helper functions: get_restricted_links, unrestrict_link, clean_filename, log_download_speed, get_plex_section_id, trigger_plex_scan, trigger_emby_scan, trigger_media_scan unchanged...]
+# [get_plex_section_id, trigger_plex_scan, trigger_media_scan functions here...]
+
+def clean_filename(original_name):
+    cleaned = original_name
+    for pattern in REMOVE_WORDS:
+        cleaned = re.sub(rf"{re.escape(pattern)}", "", cleaned, flags=re.IGNORECASE)
+    name_part, ext_part = os.path.splitext(cleaned)
+    name_part = re.sub(r"[\W_]+", "-", name_part).strip("-")
+    return f"{name_part or 'file'}"
 
 def process_symlink_creation(data, task_id):
     with download_lock:
         if task_id not in download_statuses:
-            download_statuses[task_id] = {
-                "status": "queued",
-                "progress": 0,
-                "speed": 0,
-                "error": None
-            }
+            download_statuses[task_id] = {"status": "queued", "progress": 0, "speed": 0, "error": None}
 
     try:
         torrent_id = data['torrent_id']
@@ -169,110 +154,69 @@ def process_symlink_creation(data, task_id):
                                   headers={"Authorization": f"Bearer {RD_API_KEY}"},
                                   timeout=15).json()
 
-        if not torrent_info.get("files") or not torrent_info.get("filename"):
-            return jsonify({"error": "Invalid torrent"}), 400
-
         selected_files = [f for f in torrent_info["files"] if f.get("selected") == 1]
-        if not selected_files:
-            return jsonify({"error": "No files selected"}), 400
-
-        created_paths = []
-        base_dir = DOWNLOAD_COMPLETE_PATH if ENABLE_DOWNLOADS else SYMLINK_BASE_PATH
         base_name = clean_filename(os.path.splitext(torrent_info["filename"])[0])
-        dest_dir = base_dir / base_name
+        dest_dir = SYMLINK_BASE_PATH / base_name
         dest_dir.mkdir(parents=True, exist_ok=True)
 
+        # DEFINE STRUCTURE: RCLONE_MOUNT_PATH is /mnt/zurg/__all__
+        zurg_root = RCLONE_MOUNT_PATH.parent # This becomes /mnt/zurg
+        
+        # Possible search locations for the file
+        search_dirs = [
+            zurg_root / "scenes" / base_name,
+            RCLONE_MOUNT_PATH / torrent_info["filename"],
+            zurg_root / "__downloads__" / base_name,
+        ]
+
+        created_paths = []
         for file in selected_files:
-            try:
-                file_path = Path(file["path"].lstrip("/"))
-                dest_path = dest_dir / f"{clean_filename(file_path.stem)}{file_path.suffix.lower()}"
+            file_path_raw = Path(file["path"].lstrip("/"))
+            dest_path = dest_dir / f"{clean_filename(file_path_raw.stem)}{file_path_raw.suffix.lower()}"
+            
+            # Junk Filter
+            if "996gg" in str(file_path_raw).lower():
+                continue
 
-                if ENABLE_DOWNLOADS:
-                    log_download_speed(task_id, torrent_id, dest_path)
-                else:
-                    if any(word in str(file_path).lower() for word in ["996gg"]):
-                        logging.info(f"Skipping junk file: {file_path.name}")
-                        continue 
+            src_path = None
+            # Find the actual file in Zurg's sibling folders
+            for s_dir in search_dirs:
+                potential = s_dir / file_path_raw.name
+                if potential.exists():
+                    src_path = potential
+                    break
+            
+            # Final fallback to direct path
+            if not src_path:
+                src_path = RCLONE_MOUNT_PATH / torrent_info["filename"] / file_path_raw
 
-                    scenes_base = RCLONE_MOUNT_PATH.parent / "scenes"
-                    potential_dir = scenes_base / base_name
-                    src_path = None
-
-                    if potential_dir.exists():
-                        messy_file_path = potential_dir / file_path.name
-                        if messy_file_path.exists():
-                            src_path = messy_file_path
-                        else:
-                            for entry in potential_dir.iterdir():
-                                if entry.suffix.lower() in ['.mp4', '.mkv', '.avi', '.ts']:
-                                    src_path = entry
-                                    break
-                    
-                    if not src_path:
-                        src_path = RCLONE_MOUNT_PATH / torrent_info["filename"] / file_path
-
-                    try:
-                        if os.path.lexists(dest_path):
-                            dest_path.unlink()
-                        dest_path.symlink_to(src_path)
-                        logging.info(f"Symlink created: {dest_path.name} → {src_path}")
-                    except Exception as e:
-                        logging.error(f"Symlink creation failed: {e}")
-
-                    trigger_media_scan(dest_path)
-
+            if src_path and src_path.exists():
+                if os.path.lexists(dest_path):
+                    dest_path.unlink()
+                dest_path.symlink_to(src_path)
+                logging.info(f"SUCCESS: {dest_path.name} -> {src_path}")
                 created_paths.append(str(dest_path))
-            except Exception as e:
-                logging.error(f"File error: {str(e)}")
 
-        return jsonify({
-            "status": "processed" if ENABLE_DOWNLOADS else "symlink_created",
-            "created_paths": created_paths,
-            "task_id": task_id
-        }), 200
+        return jsonify({"status": "processed", "created_paths": created_paths, "task_id": task_id}), 200
+
     except Exception as e:
+        logging.error(f"CRITICAL ERROR: {str(e)}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 @app.route("/symlink", methods=["POST"])
 def create_symlink():
     data = request.get_json()
     torrent_id = data.get("torrent_id")
-    item_hash = data.get("hash", torrent_id) # Fallback to torrent_id if hash missing
+    item_hash = data.get("hash", torrent_id)
 
-    # --- DEDUPLICATION SHIELD ---
     with hash_lock:
         now = time.time()
-        if item_hash in processed_hashes:
-            if now - processed_hashes[item_hash] < HASH_LOCK_TIME:
-                logging.info(f"Deduplication: Suppressing duplicate symlink request for {item_hash}")
-                return jsonify({"status": "success", "message": "Duplicate suppressed"}), 200
+        if item_hash in processed_hashes and (now - processed_hashes[item_hash]) < HASH_LOCK_TIME:
+            return jsonify({"status": "success", "message": "Duplicate suppressed"}), 200
         processed_hashes[item_hash] = now
 
-    with queue_lock:
-        current_torrent_ids = set(active_tasks.values())
-        current_torrent_ids.update(task[2] for task in request_queue)
-        if torrent_id in current_torrent_ids:
-            return jsonify({"error": "Task already in progress"}), 409
-
-    if task_semaphore.acquire(blocking=False):
-        try:
-            task_id = str(uuid.uuid4())
-            with queue_lock:
-                active_tasks[task_id] = torrent_id
-            return process_symlink_creation(data, task_id)
-        finally:
-            task_semaphore.release()
-            with queue_lock:
-                if task_id in active_tasks:
-                    del active_tasks[task_id]
-    else:
-        task_id = str(uuid.uuid4())
-        with queue_lock:
-            request_queue.append((task_id, request.get_data(), torrent_id))
-            active_tasks[task_id] = torrent_id
-        return jsonify({"status": "queued", "task_id": task_id, "position": len(request_queue)}), 429
-
-# [Remaining routes: get_task_status, health_check unchanged...]
+    task_id = str(uuid.uuid4())
+    return process_symlink_creation(data, task_id)
 
 if __name__ == "__main__":
     workers = [TaskWorker() for _ in range(MAX_CONCURRENT_TASKS * 2)]
